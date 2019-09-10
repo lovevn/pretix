@@ -24,8 +24,9 @@ from pretix.base.i18n import (
     LazyCurrencyNumber, LazyDate, LazyLocaleException, LazyNumber, language,
 )
 from pretix.base.models import (
-    CartPosition, Device, Event, Item, ItemVariation, Order, OrderPayment,
-    OrderPosition, Quota, Seat, SeatCategoryMapping, User, Voucher,
+    CartPosition, Device, Event, GiftCard, Item, ItemVariation, Order,
+    OrderPayment, OrderPosition, Quota, Seat, SeatCategoryMapping, User,
+    Voucher,
 )
 from pretix.base.models.event import SubEvent
 from pretix.base.models.items import ItemBundle
@@ -599,7 +600,7 @@ def _check_positions(event: Event, now_dt: datetime, positions: List[CartPositio
 
 
 def _get_fees(positions: List[CartPosition], payment_provider: BasePaymentProvider, address: InvoiceAddress,
-              meta_info: dict, event: Event):
+              meta_info: dict, event: Event, gift_cards: List[GiftCard]):
     fees = []
     total = sum([c.price for c in positions])
 
@@ -607,8 +608,18 @@ def _get_fees(positions: List[CartPosition], payment_provider: BasePaymentProvid
                                                  meta_info=meta_info, positions=positions):
         if resp:
             fees += resp
-
     total += sum(f.value for f in fees)
+
+    summed = 0
+    gift_card_values = {}
+    for gc in gift_cards:
+        fval = Decimal(gc.value)  # TODO: don't require an extra query
+        fval = min(fval, total - summed)
+        if fval > 0:
+            total -= fval
+            summed += fval
+            gift_card_values[gc] = fval
+
     if payment_provider:
         payment_fee = payment_provider.calculate_fee(total)
     else:
@@ -619,17 +630,24 @@ def _get_fees(positions: List[CartPosition], payment_provider: BasePaymentProvid
                       internal_type=payment_provider.identifier)
         fees.append(pf)
 
-    return fees, pf
+    return fees, pf, gift_card_values
 
 
 def _create_order(event: Event, email: str, positions: List[CartPosition], now_dt: datetime,
                   payment_provider: BasePaymentProvider, locale: str=None, address: InvoiceAddress=None,
-                  meta_info: dict=None, sales_channel: str='web'):
-    fees, pf = _get_fees(positions, payment_provider, address, meta_info, event)
-    total = sum([c.price for c in positions]) + sum([c.value for c in fees])
+                  meta_info: dict=None, sales_channel: str='web', gift_cards: list=None):
     p = None
-
     with transaction.atomic():
+        checked_gift_cards = []
+        if gift_cards:
+            gc_qs = GiftCard.objects.select_for_update().filter(pk__in=gift_cards)  # TODO: Make sure to prevent race conditions
+            for gc in gc_qs:
+                # TODO: Re-check acceptance
+                checked_gift_cards.append(gc)
+
+        fees, pf, gift_card_values = _get_fees(positions, payment_provider, address, meta_info, event, checked_gift_cards)
+        total = pending_sum = sum([c.price for c in positions]) + sum([c.value for c in fees])
+
         order = Order(
             status=Order.STATUS_PENDING,
             event=event,
@@ -660,11 +678,30 @@ def _create_order(event: Event, email: str, positions: List[CartPosition], now_d
                 fee.tax_rule = None  # TODO: deprecate
             fee.save()
 
+        for gc, val in gift_card_values.items():
+            p = order.payments.create(
+                state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+                provider='giftcard',
+                amount=val,
+                fee=pf
+            )
+            trans = gc.transactions.create(
+                value=-1 * val,
+                order=order,
+                payment=p
+            )
+            p.info_data = {
+                'gift_card': gc.pk,
+                'transaction_id': trans.pk,
+            }
+            p.save()
+            pending_sum -= val
+
         if payment_provider and not order.require_approval:
             p = order.payments.create(
                 state=OrderPayment.PAYMENT_STATE_CREATED,
                 provider=payment_provider.identifier,
-                amount=total,
+                amount=pending_sum,
                 fee=pf
             )
 
@@ -753,7 +790,8 @@ def _order_placed_email_attendee(event: Event, order: Order, position: OrderPosi
 
 
 def _perform_order(event: Event, payment_provider: str, position_ids: List[str],
-                   email: str, locale: str, address: int, meta_info: dict=None, sales_channel: str='web'):
+                   email: str, locale: str, address: int, meta_info: dict=None, sales_channel: str='web',
+                   gift_cards: list=None):
     if payment_provider:
         pprov = event.get_payment_providers().get(payment_provider)
         if not pprov:
@@ -802,9 +840,10 @@ def _perform_order(event: Event, payment_provider: str, position_ids: List[str],
             raise OrderError(error_messages['internal'])
         _check_positions(event, now_dt, positions, address=addr)
         order, payment = _create_order(event, email, positions, now_dt, pprov,
-                                       locale=locale, address=addr, meta_info=meta_info, sales_channel=sales_channel)
+                                       locale=locale, address=addr, meta_info=meta_info, sales_channel=sales_channel,
+                                       gift_cards=gift_cards)
 
-        free_order_flow = payment and payment_provider == 'free' and order.total == Decimal('0.00') and not order.require_approval
+        free_order_flow = payment and payment_provider == 'free' and order.pending_sum == Decimal('0.00') and not order.require_approval
         if free_order_flow:
             try:
                 payment.confirm(send_mail=False, lock=not locked)
@@ -1610,12 +1649,12 @@ class OrderChangeManager:
 @app.task(base=ProfiledEventTask, bind=True, max_retries=5, default_retry_delay=1, throws=(OrderError,))
 def perform_order(self, event: Event, payment_provider: str, positions: List[str],
                   email: str=None, locale: str=None, address: int=None, meta_info: dict=None,
-                  sales_channel: str='web'):
+                  sales_channel: str='web', gift_cards: list=None):
     with language(locale):
         try:
             try:
                 return _perform_order(event, payment_provider, positions, email, locale, address, meta_info,
-                                      sales_channel)
+                                      sales_channel, gift_cards)
             except LockTimeoutException:
                 self.retry()
         except (MaxRetriesExceededError, LockTimeoutException):
