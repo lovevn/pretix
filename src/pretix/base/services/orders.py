@@ -49,8 +49,8 @@ from pretix.base.services.tasks import ProfiledEventTask, ProfiledTask
 from pretix.base.settings import PERSON_NAME_SCHEMES
 from pretix.base.signals import (
     allow_ticket_download, order_approved, order_canceled, order_changed,
-    order_denied, order_expired, order_fee_calculation, order_placed,
-    order_split, periodic_task, validate_order,
+    order_denied, order_expired, order_fee_calculation, order_paid,
+    order_placed, order_split, periodic_task, validate_order,
 )
 from pretix.celery_app import app
 from pretix.helpers.models import modelcopy
@@ -1770,3 +1770,14 @@ def change_payment_provider(order: Order, payment_provider, amount=None, new_pay
     order.total = (order.positions.aggregate(sum=Sum('price'))['sum'] or 0) + (order.fees.aggregate(sum=Sum('value'))['sum'] or 0)
     order.save(update_fields=['total'])
     return old_fee, new_fee, fee
+
+
+@receiver(order_paid, dispatch_uid="pretixbase_order_paid_giftcards")
+@transaction.atomic()
+def signal_listener_issue_giftcards(sender: Event, order: Order, **kwargs):
+    for p in order.positions.all():
+        if p.item.issue_giftcard:
+            gc = sender.organizer.issued_gift_cards.create(
+                currency=sender.currency, issued_in=p
+            )
+            gc.transactions.create(value=p.price, order=order)
